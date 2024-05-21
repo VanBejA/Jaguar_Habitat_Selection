@@ -1,0 +1,222 @@
+---
+title: "Jaguar Landcover of coexistence"
+author: "Vanesa Bejarano Alegre"
+date: "5/24/2020"
+output: word_document
+---
+# Prepare data for jaguars - Chapter 1: Landcover of coexistence
+* The purpose of this script is:
++ 1. Have the data clean and fixed
+
+# First part : Clean
+
+## Install and load packages
+
+```{r Packages, message=FALSE, warning=FALSE}
+
+rm(list= ls())  #clean all before to start
+
+listpacks <- c("tidyverse","lubridate", "lutz", "sf", "amt")
+
+if(!require(install.load)) install.packages('install.load'); library(install.load)
+install.load::install_load(listpacks)
+
+```
+
+### R Packages
+**_Tidyverse_** is a collection of R-packages designed for data science.
+
+**_Lubridate_** is an R-package that makes it easier to work with dates and times. 
+
+**_Lutz_** is an R-package that help us to find the time zones of the individuals through location.
+
+**_sf_** is an R-package that help us to convert to UTM our data
+
+
+## Set working directory and load data
+
+```{r Directory, message=FALSE}
+
+setwd("D:/PhD_Jaguar/Jaguar01/00_Script_to_submit/Jaguar_Data")
+
+jaguar <- read.csv('jaguar_movement_data.csv', header = T, sep = ',', dec = '.', comment.char = '')
+
+info <- read.csv('Jaguar_additional_information.csv', header = T, sep = ',', dec = '.', comment.char = '')
+
+source("00_Jaguar01_Source.R")
+
+jaguar <-  merge(jaguar, info, by.x = "individual.local.identifier..ID.", by.y = "ï..ID")
+
+```
+
+Next, we change the names of  long names of variables
+#### First we check the current names
+
+```{r check variables}
+variable.names(jaguar)
+```
+
+```{r delete and change variables names}
+
+#Delete some columns
+jaguar <- dplyr::select(jaguar, -c("individual.taxon.canonical.name","country", "study.name","Collar.Type", "Collar.Brand","Planned.Schedule.Expected", "Observations","X..Locations","Project.Leader","Contact","Checked.plan.schedule" ))
+
+#Change variables
+jaguar <- jaguar %>% 
+  rename(
+    individual.local.identifier=individual.local.identifier..ID.,
+    event= Event_ID,
+    timestamp= timestamp,
+    location.long=location.long,
+    location.lat=location.lat,
+    tag=tag.local.identifier,
+    sex=Sex,
+    age=Age,
+    weight= Weight,
+    country=Country,
+    schedule=Planned.Schedule.Expected..h.,
+    ecoregion=ECO.REGION
+  )
+```
+
+*** 
+#     Data preparation process
+Firstly we will standardize date and time and create a new column 'timestampNEW' with this new information. Then we will change the date-time  for each time zone that the jaguar data is found.
+
+#### Standardize date and time
+
+```{r Date-Time, results=hide}
+jaguar$timestampUTC <- mdy_hm(jaguar$timestamp)
+
+as_datetime(jaguar$timestampUTC) #checking if everythink date-time format [ok]
+
+any(is.na(jaguar$timestampUTC)) #cheking if we missed a data-time format [ok]
+
+str(jaguar$timestampUTC) #[ok]
+
+```
+
+Then we order all data with _id_ and _timestampUTC_ and we change the date-time to the true time zone
+
+#### Order the columns
+
+```{r Order columns, results='hide'}
+jaguar <- arrange(jaguar, individual.local.identifier, timestampUTC)
+```
+
+#### Time zones
+
+```{r found tz,}
+jaguar$tz <- tz_lookup_coords(lat= jaguar$location.lat, lon = jaguar$location.long, method = "accurate")
+```
+
+```{r timezone, }
+
+for (i in 1:nrow(jaguar)){
+  jaguar$timestampTZ[i] <- strftime(jaguar$timestampUTC[i],
+         format="%Y-%m-%d %H:%M", 
+tz = as.character(jaguar$tz[i]),
+usetz = FALSE)
+  }
+  
+
+# Order everything just in case
+jaguar <- arrange(jaguar, individual.local.identifier, timestampTZ)
+
+#transform to a POSIXct
+
+jaguar$timestampTZ <- ymd_hm(jaguar$timestampTZ)
+
+```
+
+
+Now we will check if the dataset has duplicate data, then we will remove the collected points within a period of less than 25 minutes and the we will order it again
+
+#### Checking duplicate data
+
+```{r, duplicate}
+Dupl<-duplicated(jaguar[,c("timestampTZ", "location.lat","location.long","individual.local.identifier")])
+sum(Dupl) #no dumplicates
+```
+
+```{r Calculation of time between fixes,}
+inds <- unique(jaguar$individual.local.identifier)
+jaguar$time.diff <- unlist(sapply(inds, FUN = time.between, dat = jaguar))
+
+```
+
+#### Remove points less than 25 min or 1500 sec
+```{r Remove point, message=FALSE, results= 'hide'}
+datetimelag <- jaguar %>% 
+  group_by(individual.local.identifier) %>% 
+  mutate(jag_lag = timestampUTC - lag(timestampUTC, default = NA))
+
+jag_exc <- dplyr::filter(datetimelag, jag_lag < 1500) # 25min =1500 sec
+jag_remove <- anti_join(datetimelag, jag_exc)
+
+jaguar <- jag_remove
+
+
+```
+
+#### Order the points again
+```{r Order point, results='hide'}
+#Data frame
+jaguar <- arrange(jaguar, individual.local.identifier, timestampTZ)
+jaguar$event <- seq.int(nrow(jaguar))
+
+jaguar <- as.tibble(jaguar)
+```
+From here we will work only with tibble. 
+
+***
+# UTM
+#### Convert to UTM
+```{r UTM, results= 'hide', message= FALSE}
+
+sf_sample <- sf::st_as_sf(jaguar, coords = c("location.long", "location.lat"),
+                          crs = 4326)
+
+jaguarUTM <- sf_sample%>%
+  do(cbind(., st_coordinates(.))) %>%
+  mutate(EPSG = utm_epsg(lat = Y, lon = X )) %>%
+  group_by(EPSG) %>%
+  do(cbind(as.data.frame(.) %>% 
+             select(event, individual.local.identifier, sex, age, weight, country, ecoregion, schedule, tz, timestampUTC, timestampTZ,time.diff),
+           st_coordinates(st_transform(., crs = head(.$EPSG, 1))))) %>%
+  ungroup()
+
+jaguarUTM <- arrange(jaguarUTM, individual.local.identifier, timestampTZ)
+
+# Adding lat and lon data
+
+jaguarUTM$location.long <- jaguar$location.long
+
+jaguarUTM$location.lat <- jaguar$location.lat
+```
+
+*** 
+
+## Adding new columns
+Finally, to have our data sets ready, we are going to add some columns that we consider important.
+First, we will add a column that tells us if it is day or night 
+
+#### Day or night column
+```{r daynight period}
+jaguarUTM$hour <- hour(jaguarUTM$timestampTZ) #create a column
+jaguarUTM$DayNight <-  ifelse( jaguarUTM$hour <6 | 17 < jaguarUTM$hour, "Night", "Day")
+jaguarUTM$hour <- NULL #then deleted it
+```
+
+
+This step is to save all varibales selected.
+Now we write as a __.txt__ format to use for others analysis
+
+#### Save the work
+```{r write table}
+
+write.table(jaguarUTM ,file="00_jaguar01.txt",row.names = F,quote=F,col.names=T,sep="\t")
+
+
+```
+
